@@ -120,19 +120,19 @@ def test_flow_sampler():
     print("\n" + "="*60)
     print("测试 3: Flow 采样器")
     print("="*60)
-    
+
     # 加载机器人模型
     urdf_path = "robots/panda_arm.urdf"
     chain = parse_urdf(urdf_path)
     print(f"加载机器人: {urdf_path}")
-    
+
     # 创建采样器
     sampler = FlowSampler(chain, device='cpu', noise_std=0.1)
-    
+
     # 测试单样本采样
     print("\n测试单样本采样...")
     target_pos = np.array([0.3, 0.0, 0.5])
-    
+
     try:
         sample = sampler.sample_single(target_pos, seed=42)
         print(f"  目标位置: {sample['target_pos']}")
@@ -144,6 +144,45 @@ def test_flow_sampler():
     except Exception as e:
         print(f"\n✗ 单样本采样失败: {e}")
         print("  注意: IK 求解可能需要多次尝试或调整参数")
+        return
+
+    # 测试批量采样
+    print("\n测试批量采样...")
+    try:
+        # 使用基础映射库生成多个目标位置
+        from mfik.data import create_base_mapping
+        mapping = create_base_mapping(chain, n_samples=100, device='cpu', seed=42)
+
+        # 选择一些目标位置
+        n_targets = 10
+        target_positions = mapping.positions[:n_targets]
+        target_quaternions = mapping.quaternions[:n_targets]
+        q_inits = mapping.joint_configs[:n_targets]
+
+        # 批量采样
+        samples = sampler.sample_batch(
+            target_positions,
+            target_quaternions,
+            q_inits,
+            batch_size=5,
+            verbose=False
+        )
+
+        print(f"  批量采样完成: {len(samples['q_t'])} 样本")
+        print(f"  q_t shape: {samples['q_t'].shape}")
+        print(f"  v_t shape: {samples['v_t'].shape}")
+
+        # 验证数据维度
+        assert samples['q_t'].shape == (n_targets, chain.n_joints)
+        assert samples['v_t'].shape == (n_targets, chain.n_joints)
+        assert samples['target_pos'].shape == (n_targets, 3)
+        assert samples['target_quat'].shape == (n_targets, 4)
+
+        print("\n✓ 批量采样成功")
+    except Exception as e:
+        print(f"\n✗ 批量采样失败: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def test_dataset():
