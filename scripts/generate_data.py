@@ -84,7 +84,7 @@ def parse_args():
     parser.add_argument(
         '--batch-size',
         type=int,
-        default=32,
+        default=1024,
         help='IK 求解批量大小'
     )
 

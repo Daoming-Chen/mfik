@@ -9,11 +9,16 @@ import argparse
 from pathlib import Path
 import random
 
+import os
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
 
 from mfik.model.v1 import MeanFlowNet, ModelConfig
 from mfik.train.v1 import TrainConfig, MeanFlowTrainer, create_scheduler
@@ -171,22 +176,62 @@ class MeanFlowDataset(torch.utils.data.Dataset):
         """
         self.data = torch.load(data_path, weights_only=False)
 
-        # Validate data format
-        required_keys = ["q", "target_pose", "q_target", "r", "t"]
-        for key in required_keys:
-            if key not in self.data:
-                raise ValueError(f"Dataset missing required key: {key}")
+        # Check if using new format (from generate_data.py) or old format
+        if "q_t" in self.data:
+            # New format: convert to expected format
+            required_keys = ["q_t", "target_pos", "target_quat", "r", "t"]
+            for key in required_keys:
+                if key not in self.data:
+                    raise ValueError(f"Dataset missing required key: {key}")
+            
+            # Convert numpy arrays to tensors if needed
+            def to_tensor(x):
+                if isinstance(x, np.ndarray):
+                    return torch.from_numpy(x)
+                return x
+            
+            # Use q_t as initial joint configuration
+            self.q = to_tensor(self.data["q_t"])
+            
+            # Combine target_pos and target_quat into target_pose [x, y, z, qx, qy, qz, qw]
+            self.target_pose = torch.cat([
+                to_tensor(self.data["target_pos"]),
+                to_tensor(self.data["target_quat"])
+            ], dim=-1)
+            
+            # Use q_star as q_target if available, otherwise use q_t (identity mapping)
+            if "q_star" in self.data and self.data["q_star"] is not None:
+                self.q_target = to_tensor(self.data["q_star"])
+            else:
+                # Fallback: use q_t itself (though this is not ideal for training)
+                print("Warning: q_star not found in dataset, using q_t as q_target")
+                self.q_target = self.q
+            
+            self.r = to_tensor(self.data["r"]).unsqueeze(-1) if to_tensor(self.data["r"]).dim() == 1 else to_tensor(self.data["r"])
+            self.t = to_tensor(self.data["t"]).unsqueeze(-1) if to_tensor(self.data["t"]).dim() == 1 else to_tensor(self.data["t"])
+        else:
+            # Old format: validate directly
+            required_keys = ["q", "target_pose", "q_target", "r", "t"]
+            for key in required_keys:
+                if key not in self.data:
+                    raise ValueError(f"Dataset missing required key: {key}")
+            
+            self.q = self.data["q"]
+            self.target_pose = self.data["target_pose"]
+            self.q_target = self.data["q_target"]
+            self.r = self.data["r"]
+            self.t = self.data["t"]
 
     def __len__(self):
-        return len(self.data["q"])
+        return len(self.q)
 
     def __getitem__(self, idx):
         return {
-            "q": self.data["q"][idx],
-            "target_pose": self.data["target_pose"][idx],
-            "q_target": self.data["q_target"][idx],
-            "r": self.data["r"][idx],
-            "t": self.data["t"][idx],
+            "q": self.q[idx],
+            "target_pose": self.target_pose[idx],
+            "q_target": self.q_target[idx],
+            "r": self.r[idx],
+            "t": self.t[idx],
         }
 
 

@@ -44,3 +44,21 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Data files (too large for git)
+data/*.pt
+data/*.pth
+data/*.pkl
+data/*.h5
+data/*.hdf5
+
+# Model outputs and checkpoints
+outputs/
+results/
+checkpoints/
+logs/
+*.pth
+*.ckpt
+
+# Tensorboard logs
+events.out.tfevents.*
+

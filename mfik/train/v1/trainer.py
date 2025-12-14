@@ -12,7 +12,8 @@ from typing import Optional, Dict, Any, Callable
 
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast
+from torch.cuda.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
 from .config import TrainConfig
@@ -124,21 +125,17 @@ class MeanFlowTrainer:
         tangent_x = torch.cat([tangent_q, tangent_pose, tangent_r, tangent_t], dim=-1)
 
         # Compute JVP: d/dt u = v_t · ∇_q u + ∂u/∂t
-        # Using torch.func.jvp (Jacobian-Vector Product)
+        # Using torch.func.jvp (Jacobian-Vector Product) with vmap for batching
         def model_fn(x_input):
             return self.model(x_input)
 
-        # Compute JVP for each sample in batch
-        jvp_results = []
-        for i in range(batch_size):
-            x_i = x[i:i+1]  # [1, input_dim]
-            tangent_i = tangent_x[i:i+1]  # [1, input_dim]
-
-            # JVP computation
-            _, jvp_i = torch.func.jvp(model_fn, (x_i,), (tangent_i,))
-            jvp_results.append(jvp_i)
-
-        jvp_output = torch.cat(jvp_results, dim=0)  # [B, DOF]
+        # Batch JVP computation using vmap
+        def single_jvp(x_i, tangent_i):
+            _, jvp_i = torch.func.jvp(lambda x: model_fn(x.unsqueeze(0)), (x_i,), (tangent_i,))
+            return jvp_i.squeeze(0)
+        
+        # Apply vmap to batch the JVP computation
+        jvp_output = torch.vmap(single_jvp)(x, tangent_x)  # [B, DOF]
 
         # MeanFlow loss: || v_t · ∇_q u + ∂u/∂t ||^2
         # Note: jvp_output = v_t · ∇_q u + ∂u/∂t
@@ -196,7 +193,7 @@ class MeanFlowTrainer:
         t = batch["t"].to(self.device)
 
         # Forward pass with mixed precision
-        with autocast(enabled=self.config.use_amp):
+        with autocast(device_type='cuda', enabled=self.config.use_amp):
             metrics = self.compute_meanflow_loss(q, target_pose, q_target, r, t)
             loss = metrics["loss"]
 
@@ -226,11 +223,11 @@ class MeanFlowTrainer:
             # Optimizer step
             self.optimizer.step()
 
-        self.optimizer.zero_grad()
-
-        # Scheduler step
+        # Scheduler step (must be after optimizer.step())
         if self.scheduler is not None:
             self.scheduler.step()
+
+        self.optimizer.zero_grad()
 
         # Convert metrics to float
         metrics_float = {k: v.item() if torch.is_tensor(v) else v for k, v in metrics.items()}
@@ -269,7 +266,7 @@ class MeanFlowTrainer:
                 r = batch["r"].to(self.device)
                 t = batch["t"].to(self.device)
 
-                with autocast(enabled=self.config.use_amp):
+                with autocast(device_type='cuda', enabled=self.config.use_amp):
                     metrics = self.compute_meanflow_loss(q, target_pose, q_target, r, t)
 
                 total_loss += metrics["loss"].item()
