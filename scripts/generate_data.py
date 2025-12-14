@@ -80,6 +80,14 @@ def parse_args():
         help='时间参数分布'
     )
 
+    parser.add_argument(
+        '--sampling-strategy',
+        type=str,
+        default='local',
+        choices=['local', 'global'],
+        help='采样策略: local (局部扰动) 或 global (全局混合)'
+    )
+
     # 批量处理参数
     parser.add_argument(
         '--batch-size',
@@ -229,11 +237,13 @@ def main():
         chain,
         device=args.device,
         noise_std=args.noise_std,
-        time_distribution=args.time_distribution
+        time_distribution=args.time_distribution,
+        sampling_strategy=args.sampling_strategy
     )
     print(f"采样器配置:")
     print(f"  噪声标准差: {args.noise_std}")
     print(f"  时间分布: {args.time_distribution}")
+    print(f"  采样策略: {args.sampling_strategy}")
 
     # 生成目标位姿
     print("\n" + "-"*70)

@@ -41,7 +41,8 @@ def compute_pose_error(
     batch_size = q_pred.shape[0]
     
     # Compute FK
-    pred_pose = fk.forward(q_pred)  # Returns [batch, 7]
+    pred_positions, pred_quaternions = fk.compute(q_pred)
+    pred_pose = torch.cat([pred_positions, pred_quaternions], dim=-1)  # [batch, 7]
     
     # Position error (Euclidean distance)
     pos_pred = pred_pose[:, :3]

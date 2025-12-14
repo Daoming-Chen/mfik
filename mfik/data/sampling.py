@@ -16,6 +16,35 @@ from ..robot.forward_kinematics import ForwardKinematics
 from ..robot.inverse_kinematics import InverseKinematics
 
 
+def sample_random_configurations(chain: KinematicChain, 
+                                 n_samples: int,
+                                 seed: Optional[int] = None) -> np.ndarray:
+    """
+    采样随机关节配置
+    
+    在关节限位范围内均匀采样随机关节配置，用于生成测试数据。
+    
+    Args:
+        chain: 运动学链
+        n_samples: 采样数量
+        seed: 随机种子
+        
+    Returns:
+        关节配置数组 [n_samples, n_joints]
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    n_joints = chain.n_joints
+    lower = chain.lower_limits
+    upper = chain.upper_limits
+    
+    # 在关节限位范围内均匀采样
+    q_samples = np.random.uniform(lower, upper, size=(n_samples, n_joints))
+    
+    return q_samples
+
+
 def sample_reverse_perturbation(q_star: np.ndarray,
                                 noise_std: float = 0.1,
                                 joint_limits: Optional[Tuple[np.ndarray, np.ndarray]] = None,
@@ -148,18 +177,21 @@ class FlowSampler:
                  chain: KinematicChain,
                  device: str = 'cpu',
                  noise_std: float = 0.1,
-                 time_distribution: str = 'beta'):
+                 time_distribution: str = 'beta',
+                 sampling_strategy: str = 'local'):
         """
         Args:
             chain: 运动学链
             device: 计算设备
             noise_std: 扰动噪声标准差
             time_distribution: 时间参数分布
+            sampling_strategy: 采样策略 ('local' 或 'global')
         """
         self.chain = chain
         self.device = device
         self.noise_std = noise_std
         self.time_distribution = time_distribution
+        self.sampling_strategy = sampling_strategy
         
         self.fk = ForwardKinematics(chain, device)
         self.ik = InverseKinematics(chain, device)
@@ -207,8 +239,17 @@ class FlowSampler:
         q_star = q_star.detach().cpu().numpy()
         
         # 2. 逆向扰动采样得到 q_0
-        q_0 = sample_reverse_perturbation(q_star, self.noise_std, 
-                                         self.joint_limits, seed)
+        if self.sampling_strategy == 'global':
+            # 全局采样: 50% 概率使用均匀随机采样，50% 概率使用大噪声扰动
+            if np.random.random() < 0.5:
+                q_0 = sample_random_configurations(self.chain, 1, seed=None)[0]
+            else:
+                q_0 = sample_reverse_perturbation(q_star, self.noise_std, 
+                                                 self.joint_limits, seed)
+        else:
+            # 局部采样
+            q_0 = sample_reverse_perturbation(q_star, self.noise_std, 
+                                             self.joint_limits, seed)
         
         # 3. 采样时间参数 (r, t)
         r, t = sample_time_parameters(1, distribution=self.time_distribution, seed=seed)
@@ -279,18 +320,61 @@ class FlowSampler:
             end = min((i + 1) * batch_size, n_samples)
             batch_len = end - start
             
-            # 批量 IK 求解
-            pos_batch = torch.from_numpy(target_positions[start:end]).float()
-            quat_batch = torch.from_numpy(target_quaternions[start:end]).float() if target_quaternions is not None else None
-            q_init_batch = torch.from_numpy(q_inits[start:end]).float() if q_inits is not None else None
+            # 1. Generate q_0 first (for global strategy)
+            if self.sampling_strategy == 'global':
+                # 50% random q_0, 50% perturbed q_star (but we don't have q_star yet)
+                # Wait, if we want q_star to be close to q_0, we must generate q_0 first.
+                # But for "perturbed" strategy, we need q_star first.
+                # So we split the batch.
+                
+                mask = np.random.random(batch_len) < 0.5
+                q_0_batch = np.zeros((batch_len, self.chain.n_joints))
+                q_star_batch = np.zeros((batch_len, self.chain.n_joints))
+                
+                # Case A: Random q_0 -> Solve IK -> q_star (Closest solution)
+                if np.any(mask):
+                    n_random = np.sum(mask)
+                    q_0_random = sample_random_configurations(self.chain, n_random)
+                    q_0_batch[mask] = q_0_random
+                    
+                    # Solve IK using q_0 as init
+                    pos_random = torch.from_numpy(target_positions[start:end][mask]).float()
+                    quat_random = torch.from_numpy(target_quaternions[start:end][mask]).float() if target_quaternions is not None else None
+                    q_init_random = torch.from_numpy(q_0_random).float()
+                    
+                    q_star_random = self.ik.solve_batch(pos_random, quat_random, q_init_random,
+                                                      method='dls', tolerance=1e-6, max_iter=500)
+                    q_star_batch[mask] = q_star_random.detach().cpu().numpy()
+
+                # Case B: Solve IK (random init) -> q_star -> Perturb -> q_0 (Local exploration)
+                if np.any(~mask):
+                    n_local = np.sum(~mask)
+                    pos_local = torch.from_numpy(target_positions[start:end][~mask]).float()
+                    quat_local = torch.from_numpy(target_quaternions[start:end][~mask]).float() if target_quaternions is not None else None
+                    q_init_local = torch.from_numpy(q_inits[start:end][~mask]).float() if q_inits is not None else None
+                    
+                    q_star_local = self.ik.solve_batch(pos_local, quat_local, q_init_local,
+                                                     method='dls', tolerance=1e-6, max_iter=500)
+                    q_star_local_np = q_star_local.detach().cpu().numpy()
+                    q_star_batch[~mask] = q_star_local_np
+                    
+                    q_0_local = sample_reverse_perturbation(q_star_local_np, self.noise_std, self.joint_limits)
+                    q_0_batch[~mask] = q_0_local
+
+            else:
+                # Local strategy: Solve IK -> q_star -> Perturb -> q_0
+                pos_batch = torch.from_numpy(target_positions[start:end]).float()
+                quat_batch = torch.from_numpy(target_quaternions[start:end]).float() if target_quaternions is not None else None
+                q_init_batch = torch.from_numpy(q_inits[start:end]).float() if q_inits is not None else None
+                
+                q_star_batch = self.ik.solve_batch(pos_batch, quat_batch, q_init_batch,
+                                                  method='dls', tolerance=1e-6, max_iter=500)
+                q_star_batch = q_star_batch.detach().cpu().numpy()
+                
+                q_0_batch = sample_reverse_perturbation(q_star_batch, self.noise_std, 
+                                                       self.joint_limits)
             
-            q_star_batch = self.ik.solve_batch(pos_batch, quat_batch, q_init_batch,
-                                              method='dls', tolerance=1e-6, max_iter=500)
-            q_star_batch = q_star_batch.detach().cpu().numpy()
-            
-            # 批量扰动采样
-            q_0_batch = sample_reverse_perturbation(q_star_batch, self.noise_std, 
-                                                   self.joint_limits)
+            # 批量时间参数
             
             # 批量时间参数
             r_batch, t_batch = sample_time_parameters(batch_len, 

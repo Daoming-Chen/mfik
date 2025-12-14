@@ -12,8 +12,7 @@ from typing import Optional, Dict, Any, Callable
 
 import torch
 import torch.nn as nn
-from torch.amp import autocast
-from torch.cuda.amp import GradScaler
+from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 
 from .config import TrainConfig
@@ -63,7 +62,7 @@ class MeanFlowTrainer:
         self.scheduler = None
 
         # Mixed precision
-        self.scaler = GradScaler() if config.use_amp else None
+        self.scaler = GradScaler('cuda') if config.use_amp else None
 
         # Tracking
         self.global_step = 0
@@ -80,6 +79,7 @@ class MeanFlowTrainer:
         q_target: torch.Tensor,
         r: torch.Tensor,
         t: torch.Tensor,
+        v_t_gt: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute MeanFlow loss using JVP.
@@ -90,6 +90,7 @@ class MeanFlowTrainer:
             q_target: Target joint angles [B, DOF]
             r: Reference time parameter [B, 1]
             t: Evaluation time parameter [B, 1]
+            v_t_gt: Ground truth velocity [B, DOF] (optional)
 
         Returns:
             Dictionary with loss and metrics
@@ -103,43 +104,22 @@ class MeanFlowTrainer:
         # Compute velocity field u(q, r, t)
         u = self.model(x)  # [B, DOF]
 
-        # Compute flow velocity v_t = (q_target - q) / (1 - r)
-        # Note: We use linear interpolation q_t = q + v_t * (t - r)
-        dt = torch.clamp(1.0 - r, min=1e-8)  # Avoid division by zero
-        v_t = (q_target - q) / dt  # [B, DOF]
+        # Compute flow velocity v_t
+        if v_t_gt is not None:
+            v_t = v_t_gt
+        else:
+            # Fallback: Compute flow velocity v_t = (q_target - q) / (1 - t)
+            # Note: This is unstable when t -> 1
+            dt = torch.clamp(1.0 - t, min=1e-8)  # Avoid division by zero
+            v_t = (q_target - q) / dt  # [B, DOF]
 
         # Stop gradient on v_t (treat as constant for JVP)
         v_t = v_t.detach()
 
-        # Compute time derivative ∂u/∂t using JVP
-        # We need to compute: v_t · ∇_q u + ∂u/∂t
-
-        # Create tangent vectors for JVP
-        # For ∂u/∂q: tangent is v_t (flow velocity)
-        # For ∂u/∂t: tangent is 1.0
-        tangent_q = v_t  # [B, DOF]
-        tangent_t = torch.ones_like(t)  # [B, 1]
-        tangent_r = torch.zeros_like(r)  # [B, 1]
-        tangent_pose = torch.zeros_like(target_pose)  # [B, 7]
-
-        tangent_x = torch.cat([tangent_q, tangent_pose, tangent_r, tangent_t], dim=-1)
-
-        # Compute JVP: d/dt u = v_t · ∇_q u + ∂u/∂t
-        # Using torch.func.jvp (Jacobian-Vector Product) with vmap for batching
-        def model_fn(x_input):
-            return self.model(x_input)
-
-        # Batch JVP computation using vmap
-        def single_jvp(x_i, tangent_i):
-            _, jvp_i = torch.func.jvp(lambda x: model_fn(x.unsqueeze(0)), (x_i,), (tangent_i,))
-            return jvp_i.squeeze(0)
-        
-        # Apply vmap to batch the JVP computation
-        jvp_output = torch.vmap(single_jvp)(x, tangent_x)  # [B, DOF]
-
-        # MeanFlow loss: || v_t · ∇_q u + ∂u/∂t ||^2
-        # Note: jvp_output = v_t · ∇_q u + ∂u/∂t
-        meanflow_residual = jvp_output  # [B, DOF]
+        # Conditional Flow Matching Loss: || u - v_t ||^2
+        # We want the learned velocity field u to match the conditional vector field v_t
+        diff = u - v_t
+        loss_per_sample = torch.sum(diff ** 2, dim=-1, keepdim=True)  # [B, 1]
 
         # Compute adaptive weights if configured
         if self.config.loss_weight_type == "adaptive":
@@ -151,14 +131,13 @@ class MeanFlowTrainer:
             weights = torch.ones(batch_size, 1, device=self.device)
 
         # Weighted loss
-        loss_per_sample = torch.sum(meanflow_residual ** 2, dim=-1, keepdim=True)  # [B, 1]
         weighted_loss = weights * loss_per_sample  # [B, 1]
         loss = weighted_loss.mean()
 
         # Metrics
         metrics = {
             "loss": loss,
-            "meanflow_residual": meanflow_residual.abs().mean(),
+            "velocity_error": diff.norm(dim=-1).mean(),
             "velocity_norm": u.norm(dim=-1).mean(),
             "flow_velocity_norm": v_t.norm(dim=-1).mean(),
         }
@@ -194,7 +173,8 @@ class MeanFlowTrainer:
 
         # Forward pass with mixed precision
         with autocast(device_type='cuda', enabled=self.config.use_amp):
-            metrics = self.compute_meanflow_loss(q, target_pose, q_target, r, t)
+            v_t_gt = batch["v_t"].to(self.device) if "v_t" in batch else None
+            metrics = self.compute_meanflow_loss(q, target_pose, q_target, r, t, v_t_gt)
             loss = metrics["loss"]
 
         # Backward pass
@@ -270,12 +250,12 @@ class MeanFlowTrainer:
                     metrics = self.compute_meanflow_loss(q, target_pose, q_target, r, t)
 
                 total_loss += metrics["loss"].item()
-                total_residual += metrics["meanflow_residual"].item()
+                total_residual += metrics["velocity_error"].item()
                 num_batches += 1
 
         val_metrics = {
             "val_loss": total_loss / num_batches,
-            "val_residual": total_residual / num_batches,
+            "val_velocity_error": total_residual / num_batches,
         }
 
         return val_metrics

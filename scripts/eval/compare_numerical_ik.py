@@ -97,7 +97,8 @@ def main():
     print(f"\nGenerating {args.n_samples} random test poses...")
     q_samples = sample_random_configurations(chain, args.n_samples)
     q_samples = torch.tensor(q_samples, dtype=torch.float32, device=args.device)
-    test_poses = fk.forward(q_samples)
+    positions, quaternions = fk.compute(q_samples)
+    test_poses = torch.cat([positions, quaternions], dim=-1)  # [N, 7]
     
     # Random initial guesses
     q_init = torch.rand_like(q_samples) * 2 - 1

@@ -105,33 +105,26 @@ def train(
                 for key, value in metrics.items():
                     trainer.writer.add_scalar(f"train/{key}", value, trainer.global_step)
 
-            # Validation
-            if trainer.global_step % config.eval_interval == 0:
-                val_metrics = trainer.validate(val_loader)
-                for key, value in val_metrics.items():
-                    trainer.writer.add_scalar(f"val/{key}", value, trainer.global_step)
-
-                print(f"\nStep {trainer.global_step} - Val Loss: {val_metrics['val_loss']:.4f}")
-
-                # Save best model
-                if val_metrics["val_loss"] < trainer.best_loss:
-                    trainer.best_loss = val_metrics["val_loss"]
-                    best_path = checkpoint_dir / "best_model.pth"
-                    trainer.save_checkpoint(
-                        str(best_path),
-                        metadata={"val_loss": val_metrics["val_loss"]},
-                    )
-                    print(f"Saved best model to {best_path}")
-
-            # Checkpoint saving
-            if trainer.global_step % config.checkpoint_interval == 0:
-                checkpoint_path = checkpoint_dir / f"checkpoint_step_{trainer.global_step}.pth"
-                trainer.save_checkpoint(str(checkpoint_path))
-                print(f"\nSaved checkpoint to {checkpoint_path}")
-
         # Epoch summary
         avg_loss = np.mean([m["loss"] for m in epoch_metrics])
         print(f"\nEpoch {epoch+1} - Average Loss: {avg_loss:.4f}")
+
+        # Validation at end of epoch
+        val_metrics = trainer.validate(val_loader)
+        for key, value in val_metrics.items():
+            trainer.writer.add_scalar(f"val/{key}", value, trainer.global_step)
+
+        print(f"Epoch {epoch+1} - Val Loss: {val_metrics['val_loss']:.4f}")
+
+        # Save best model if validation loss improved
+        if val_metrics["val_loss"] < trainer.best_loss:
+            trainer.best_loss = val_metrics["val_loss"]
+            best_path = checkpoint_dir / "best_model.pth"
+            trainer.save_checkpoint(
+                str(best_path),
+                metadata={"val_loss": val_metrics["val_loss"]},
+            )
+            print(f"Saved best model to {best_path}")
 
         # Save epoch checkpoint
         epoch_checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pth"
@@ -207,6 +200,12 @@ class MeanFlowDataset(torch.utils.data.Dataset):
                 print("Warning: q_star not found in dataset, using q_t as q_target")
                 self.q_target = self.q
             
+            # Load v_t if available
+            if "v_t" in self.data:
+                self.v_t = to_tensor(self.data["v_t"])
+            else:
+                self.v_t = None
+
             self.r = to_tensor(self.data["r"]).unsqueeze(-1) if to_tensor(self.data["r"]).dim() == 1 else to_tensor(self.data["r"])
             self.t = to_tensor(self.data["t"]).unsqueeze(-1) if to_tensor(self.data["t"]).dim() == 1 else to_tensor(self.data["t"])
         else:
@@ -221,18 +220,22 @@ class MeanFlowDataset(torch.utils.data.Dataset):
             self.q_target = self.data["q_target"]
             self.r = self.data["r"]
             self.t = self.data["t"]
+            self.v_t = self.data.get("v_t", None)
 
     def __len__(self):
         return len(self.q)
 
     def __getitem__(self, idx):
-        return {
+        item = {
             "q": self.q[idx],
             "target_pose": self.target_pose[idx],
             "q_target": self.q_target[idx],
             "r": self.r[idx],
             "t": self.t[idx],
         }
+        if self.v_t is not None:
+            item["v_t"] = self.v_t[idx]
+        return item
 
 
 def main():
@@ -270,6 +273,9 @@ def main():
     else:
         raise ValueError(f"Unknown robot: {args.robot}")
 
+    # Disable positional encoding for better linear regression
+    model_config.use_positional_encoding = False
+
     # Create model
     model = MeanFlowNet(model_config)
     print(f"\nModel: {args.robot}")
@@ -300,13 +306,16 @@ def main():
         val_dataset = create_dummy_dataset(200, robot_dof)
 
         def collate_fn(batch):
-            return {
-                "q": torch.stack([b[0] for b in batch]),
-                "target_pose": torch.stack([b[1] for b in batch]),
-                "q_target": torch.stack([b[2] for b in batch]),
-                "r": torch.stack([b[3] for b in batch]),
-                "t": torch.stack([b[4] for b in batch]),
+            res = {
+                "q": torch.stack([b["q"] for b in batch]),
+                "target_pose": torch.stack([b["target_pose"] for b in batch]),
+                "q_target": torch.stack([b["q_target"] for b in batch]),
+                "r": torch.stack([b["r"] for b in batch]),
+                "t": torch.stack([b["t"] for b in batch]),
             }
+            if "v_t" in batch[0]:
+                res["v_t"] = torch.stack([b["v_t"] for b in batch])
+            return res
     else:
         if args.data_path is None:
             raise ValueError("--data_path required when not using --quick_test")

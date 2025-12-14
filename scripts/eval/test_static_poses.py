@@ -38,7 +38,8 @@ def generate_test_poses(urdf_path: str, n_samples: int = 10000, device: str = "c
     q_samples = torch.tensor(q_samples, dtype=torch.float32, device=device)
     
     # Compute FK to get target poses
-    target_poses = fk.forward(q_samples)
+    positions, quaternions = fk.compute(q_samples)
+    target_poses = torch.cat([positions, quaternions], dim=-1)  # [N, 7]
     
     return target_poses, q_samples
 
@@ -107,7 +108,8 @@ def evaluate_solver(
     )
     
     # Get positions for heatmap
-    pred_poses = solver.fk.forward(q_pred)
+    pred_positions, pred_quaternions = solver.fk.compute(q_pred)
+    pred_poses = torch.cat([pred_positions, pred_quaternions], dim=-1)
     plot_workspace_heatmap(
         pred_poses[:, :3], pos_errors,
         plane="xy",

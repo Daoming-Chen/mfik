@@ -102,16 +102,13 @@ class IKSolver:
         Returns:
             Initialized IKSolver instance
         """
-        # Load checkpoint
+        # Load checkpoint (CheckpointManager returns already loaded model)
         checkpoint_data = CheckpointManager.load_checkpoint(
             checkpoint_path, device=device
         )
         
+        model = checkpoint_data["model"]
         config = checkpoint_data["config"]
-        
-        # Reconstruct model
-        model = MeanFlowNet(config)
-        model.load_state_dict(checkpoint_data["model_state_dict"])
         
         return cls(
             urdf_path=urdf_path,
@@ -169,12 +166,19 @@ class IKSolver:
         
         # Inference
         with torch.no_grad():
-            # Prepare input (q_ref, target_pose, t=0, r=1)
+            # Prepare input: concatenate [q_ref, target_pose, r, t]
+            # Format: [joint_angles (DOF), target_pose (7), time_params (2)]
+            # Note: Trainer uses [q, target_pose, r, t]
+            # We want to query velocity at t=0 (start) to reach t=1 (target)
+            # r is the reference start time (0)
             t = torch.zeros(batch_size, 1, device=self.device)
-            r = torch.ones(batch_size, 1, device=self.device)
+            r = torch.zeros(batch_size, 1, device=self.device)
+            
+            # Concatenate all inputs in correct order: q, target, r, t
+            model_input = torch.cat([q_ref, target_pose, r, t], dim=-1)
             
             # Forward pass: predict velocity
-            velocity = self.model(q_ref, target_pose, t, r)
+            velocity = self.model(model_input)
             
             # Single-step update: q_pred = q_ref + velocity
             q_pred = q_ref + velocity
@@ -362,7 +366,8 @@ class IKSolver:
         Returns value in [0, 1], where 1 means perfect solution.
         """
         # Compute FK
-        pred_pose = self.fk.forward(q_pred)
+        pred_positions, pred_quaternions = self.fk.compute(q_pred)
+        pred_pose = torch.cat([pred_positions, pred_quaternions], dim=-1)
         
         # Compute errors
         from .metrics import compute_pose_error

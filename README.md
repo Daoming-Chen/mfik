@@ -62,20 +62,20 @@ python scripts/train.py --help
 ```bash
 # 静态姿态测试
 python scripts/eval/test_static_poses.py \
-    --checkpoint outputs/panda_model/checkpoints/best.pt \
+    --checkpoint outputs/panda_model/checkpoints/best_model.pth \
     --urdf robots/panda_arm.urdf \
     --n-samples 1000 \
     --device cuda
 
 # 轨迹跟踪测试
 python scripts/eval/test_trajectories.py \
-    --checkpoint outputs/panda_model/checkpoints/best.pt \
+    --checkpoint outputs/panda_model/checkpoints/best_model.pth \
     --urdf robots/panda_arm.urdf \
     --device cuda
 
 # 与数值 IK 方法对比
 python scripts/eval/compare_numerical_ik.py \
-    --checkpoint outputs/panda_model/checkpoints/best.pt \
+    --checkpoint outputs/panda_model/checkpoints/best_model.pth \
     --urdf robots/panda_arm.urdf \
     --n-samples 1000 \
     --output-dir results/comparison \
@@ -102,7 +102,7 @@ python scripts/train.py \
 
 # 4. 评估模型
 python scripts/eval/compare_numerical_ik.py \
-    --checkpoint outputs/panda/checkpoints/best.pt \
+    --checkpoint outputs/panda/checkpoints/best_model.pth \
     --urdf robots/panda_arm.urdf \
     --n-samples 1000
 ```
